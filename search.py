@@ -3,6 +3,7 @@ import json
 import torch
 import torch.nn.functional as F
 import faiss
+import numpy as np
 
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModel
@@ -29,6 +30,8 @@ LOG_PATH = os.path.join(OUTPUT_DIR, "search_selection_log.jsonl")
 
 # 상위 몇 개를 보여줄지 정한다.
 TOP_K = 5
+
+PRODUCT_EMB = np.load("output/product_embeddings.npy")
 
 
 # =========================
@@ -133,7 +136,7 @@ def search(query, embedder, index, metadata, top_k=5):
     query_vector = embedder.encode(query)
 
     # FAISS에서 상위 top_k개를 검색한다.
-    scores, indices = index.search(query_vector, top_k)
+    scores, indices = index.search(query_vector, top_k * 5)
 
     # 최종 검색 결과를 담을 리스트다.
     results = []
@@ -247,42 +250,51 @@ def print_selected_detail(selected_item):
 # =========================
 
 def ask_user_to_select(results):
-    # 결과가 없으면 선택할 수 없으므로 None 반환
     if not results:
         return None
 
     while True:
         user_input = input(
-            "\n이 질문과 가장 가까운 결과 번호를 선택하세요 (1~5, 다시검색=r, 종료=q) >>> "
+            "\n선택할 결과 번호를 입력하세요 (예: 1 또는 1,2,3 / 다시검색=r / 종료=q) >>> "
         ).strip().lower()
 
-        # 종료
         if user_input == "q":
             return "quit"
 
-        # 다시 검색
         if user_input == "r":
             return "retry"
 
-        # 숫자 입력인지 확인
-        if not user_input.isdigit():
-            print("숫자 번호를 입력하거나 r / q 를 입력하세요.")
-            continue
+        parts = user_input.split(",")
 
-        selected_rank = int(user_input)
+        selected_items = []
 
-        # 범위 검사
-        if selected_rank < 1 or selected_rank > len(results):
-            print("보여준 번호 범위 안에서 입력하세요.")
-            continue
+        for part in parts:
+            part = part.strip()
 
-        # rank 기준으로 해당 결과 반환
-        for item in results:
-            if item["rank"] == selected_rank:
-                return item
+            if not part.isdigit():
+                print("숫자 또는 1,2,3 형식으로 입력하세요.")
+                selected_items = []
+                break
 
-        print("선택한 번호를 찾지 못했습니다. 다시 입력하세요.")
+            selected_rank = int(part)
 
+            if selected_rank < 1 or selected_rank > len(results):
+                print("보여준 번호 범위 안에서 입력하세요.")
+                selected_items = []
+                break
+
+            for item in results:
+                if item["rank"] == selected_rank:
+                    selected_items.append(item)
+                    break
+
+        if selected_items:
+            unique = {}
+
+            for item in selected_items:
+                unique[item["rank"]] = item
+
+            return list(unique.values())
 
 # =========================
 # 9. 선택 로그 저장
@@ -367,13 +379,13 @@ def main():
             print("질문이 비어 있습니다.")
             continue
 
-        # 검색 수행
-        results = search(query, embedder, index, metadata, top_k=TOP_K)
+        # 조건 기반 검색 (이미 필터 + 정렬 포함)
+        results = exact_filter_search(metadata, query, embedder)
 
-        # top 결과 출력
+        # 결과 출력
         print_top_results(results)
 
-        # 사용자 선택 받기
+        # 사용자에게 결과를 선택하도록 요청한다. (1 또는 1,2,3 가능)
         selected = ask_user_to_select(results)
 
         # 사용자가 q 입력한 경우
@@ -385,19 +397,18 @@ def main():
         if selected == "retry":
             continue
 
-        # 정상 선택이면 상세 출력
-        print_selected_detail(selected)
+        for item in selected:
+            print_selected_detail(item)
+            save_selection_log(query, results, item, LOG_PATH)
 
-        # 로그 저장
-        save_selection_log(query, results, selected, LOG_PATH)
         print(f"선택 로그 저장 완료: {LOG_PATH}")
 
 
-# 직접 실행 시 main() 호출
-if __name__ == "__main__":
-    main()
+# =========================
+# 가격 문자열 → 숫자 변환 함수
+# =========================
 
-    def parse_price_to_int(value):
+def parse_price_to_int(value):
     # 값이 None이면 비교할 수 없으므로 None 반환
     if value is None:
         return None
@@ -424,8 +435,244 @@ if __name__ == "__main__":
     if cleaned == "":
         return None
 
-    # 실수로 바꾼 뒤 int 처리
+    # 실수 → 정수 변환
     try:
         return int(float(cleaned))
     except:
         return None
+    
+# =========================
+# 질문에서 가격 조건 추출
+# =========================
+# 질문에서 금액 조건을 추출하기 위해 정규표현식을 사용한다.
+import re
+
+
+# 한글 금액 단위를 실제 숫자로 바꾸는 함수다.
+# =========================
+# 한글 금액 → 숫자 변환
+# =========================
+def parse_korean_money(text):
+    if text is None:
+        return None
+
+    text = str(text).strip()
+    text = text.replace(",", "").replace(" ", "")
+    text = text.replace("원", "")
+
+    total = 0
+
+    # 억
+    eok = re.search(r"(\d+(?:\.\d+)?)억", text)
+    if eok:
+        total += int(float(eok.group(1)) * 100000000)
+
+    # 만
+    man = re.search(r"(\d+(?:\.\d+)?)만", text)
+    if man:
+        total += int(float(man.group(1)) * 10000)
+
+    # 천
+    cheon = re.search(r"(\d+(?:\.\d+)?)천", text)
+    if cheon:
+        total += int(float(cheon.group(1)) * 1000)
+
+    # 단위가 하나라도 있었으면 바로 반환
+    if total > 0:
+        return total
+
+    # 그냥 숫자만 있는 경우
+    num = re.search(r"\d+(?:\.\d+)?", text)
+    if not num:
+        return None
+
+    return int(float(num.group(0)))
+
+# =========================
+# 질문 → 가격 조건 추출
+# =========================
+def extract_price_condition(query):
+    import re
+
+    q = query.replace(" ", "")
+
+    # 연산자
+    if any(x in q for x in ["이하", "미만", "보다싼", "밑"]):
+        op = "<="
+    elif any(x in q for x in ["이상", "초과", "보다비싼"]):
+        op = ">="
+    else:
+        return None
+
+    # 🔥 금액 패턴 (숫자 없어도 잡음)
+    patterns = [
+        r"\d+(?:\.\d+)?억",
+        r"\d+(?:\.\d+)?만",
+        r"\d+(?:\.\d+)?천",
+        r"\d+(?:\.\d+)?원",
+        r"억원",
+        r"만원",
+        r"천원",
+        r"억",
+        r"만",
+        r"천"
+    ]
+
+    for p in patterns:
+        m = re.search(p, q)
+        if m:
+            text = m.group()
+
+            # 단독 단위 처리
+            if text in ["만원", "만"]:
+                value = 10000
+            elif text in ["천원", "천"]:
+                value = 1000
+            elif text in ["억원", "억"]:
+                value = 100000000
+            else:
+                value = parse_korean_money(text)
+
+            if value:
+                return (op, value)
+
+    return None
+
+def get_price_from_record(record):
+    raw = record.get("raw_data", {})
+
+    for key in ["단가(원)", "단가", "가격", "판매가", "공급가"]:
+        if key in raw:
+            return parse_price_to_int(raw[key])
+
+    return None
+
+def apply_price_filter(results, condition):
+    if condition is None:
+        return results
+
+    op, value = condition
+    filtered = []
+
+    for item in results:
+        price = get_price_from_record(item["record"])
+
+        if price is None:
+            continue
+
+        if op == "<=" and price <= value:
+            filtered.append(item)
+        elif op == ">=" and price >= value:
+            filtered.append(item)
+
+    return filtered
+
+def rerank_results(results):
+    reranked = []
+
+    for new_rank, item in enumerate(results, start=1):
+        item["rank"] = new_rank
+        reranked.append(item)
+
+    return reranked
+
+def sort_by_price(results, ascending=True):
+    return sorted(
+        results,
+        key=lambda item: get_price_from_record(item["record"]) or 999999999999,
+        reverse=not ascending
+    )
+
+def exact_filter_search(metadata, query, embedder):
+    condition = extract_price_condition(query)
+    keyword = extract_product_keyword(query)
+
+    keyword_vec = None
+
+    if keyword:
+        keyword_vec = embedder.encode(keyword)[0]
+
+    results = []
+
+    for idx, record in enumerate(metadata):
+        raw = record.get("raw_data", {})
+        product_name = str(raw.get("품목명", ""))
+
+        if keyword is not None and keyword not in product_name:
+            continue
+        price = get_price_from_record(record)
+
+        # 🔥 1. 가격 먼저 필터 (속도 핵심)
+        if condition:
+            if price is None:
+                continue
+
+            op, value = condition
+
+            if op == "<=" and price > value:
+                continue
+            if op == ">=" and price < value:
+                continue
+
+        # 🔥 2. 의미 유사도 (이미 임베딩 있음 → 빠름)
+        if keyword_vec is not None:
+            score = cosine_sim(keyword_vec, PRODUCT_EMB[idx])
+
+            if score < 0.6:
+                continue
+
+        results.append({
+            "rank": len(results) + 1,
+            "score": 1.0,
+            "metadata_index": idx,
+            "record": record
+        })
+
+    results = sort_by_price(results, ascending=True)
+    results = rerank_results(results)
+
+    return results[:TOP_K]
+
+def extract_product_keyword(query):
+    import re
+
+    q = query
+
+    remove_words = [
+        "만원", "천원", "억원",
+        "단가", "가격", "원",
+        "이하", "이상", "미만", "초과",
+        "보다싼", "보다비싼", "밑"
+    ]
+
+    for w in remove_words:
+        q = q.replace(w, "")
+
+    q = re.sub(r"\d+", "", q)
+
+    q = q.strip()
+
+    if q == "":
+        return None
+
+    return q
+
+def encode_text(text, embedder):
+    return embedder.encode(text)[0]
+
+def cosine_sim(a, b):
+    import numpy as np
+    return float(np.dot(a, b))
+
+def is_similar_keyword(keyword_vec, product_name, embedder, threshold=0.6):
+    product_vec = encode_text(product_name, embedder)
+    score = cosine_sim(keyword_vec, product_vec)
+
+    return score >= threshold
+
+# =========================
+# 메인 실행
+# =========================
+
+if __name__ == "__main__":
+    main()
